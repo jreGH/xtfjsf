@@ -51,3 +51,11 @@ def test_convert(files, tmp_path):
     assert main(["convert", str(files[1]), str(out)]) == 0
     with xj.open_sonar(out) as f:
         assert len(f.read_all()) == 120
+
+
+def test_reverse_port_flag(files, tmp_path):
+    fixed = tmp_path / "fixed.png"
+    wrong = tmp_path / "wrong.png"
+    assert main(["waterfall", str(files[0]), str(fixed), "--reverse-port", "--raw"]) == 0
+    assert main(["waterfall", str(files[0]), str(wrong), "--raw"]) == 0
+    assert fixed.read_bytes() != wrong.read_bytes()

@@ -125,3 +125,39 @@ def test_waterfall_warns_when_a_whole_side_is_missing(pings):
     port_only = [Ping(ping_number=p.ping_number, channels=[p.port]) for p in pings[:5]]
     with pytest.warns(UserWarning, match="no starboard channel in any ping"):
         xj.build_waterfall(port_only)
+
+
+def test_reverse_port_recovers_correct_range_order(pings):
+    """Simulate a system that records the port channel back-to-front."""
+    from dataclasses import replace as dc_replace
+
+    backwards = [
+        dc_replace(p, channels=[
+            dc_replace(c, samples=c.samples[::-1].copy()) if c.side == xj.PORT else c
+            for c in p.channels
+        ])
+        for p in pings
+    ]
+    ref = xj.build_waterfall(pings)
+    wrong = xj.build_waterfall(backwards)
+    fixed = xj.build_waterfall(backwards, reverse_port=True)
+
+    np.testing.assert_array_equal(fixed.port, ref.port)
+    np.testing.assert_array_equal(fixed.starboard, ref.starboard)  # unaffected
+    assert not np.array_equal(wrong.port, ref.port)
+
+
+def test_reverse_starboard_only_affects_starboard(pings):
+    from dataclasses import replace as dc_replace
+
+    backwards = [
+        dc_replace(p, channels=[
+            dc_replace(c, samples=c.samples[::-1].copy()) if c.side == xj.STARBOARD else c
+            for c in p.channels
+        ])
+        for p in pings
+    ]
+    ref = xj.build_waterfall(pings)
+    fixed = xj.build_waterfall(backwards, reverse_starboard=True)
+    np.testing.assert_array_equal(fixed.starboard, ref.starboard)
+    np.testing.assert_array_equal(fixed.port, ref.port)

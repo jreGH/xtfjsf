@@ -36,6 +36,8 @@ def _load(path, args, side=None):
             frequency=args.frequency * 1000 if args.frequency else None,
             keep_complex=True,
             side=side,
+            reverse_port=args.reverse_port,
+            reverse_starboard=args.reverse_starboard,
         )
 
 
@@ -251,6 +253,11 @@ def _add_processing_args(p):
 def _add_select_args(p):
     p.add_argument("--subsystem", type=int, default=None, help="JSF subsystem (20 low, 21 high frequency...)")
     p.add_argument("--frequency", type=float, default=None, help="pick channel nearest this frequency (kHz)")
+    p.add_argument("--reverse-port", action="store_true",
+                    help="flip port samples range-wise (near<->far); some systems record one "
+                         "channel back-to-front, which shows up as that side's seabed/targets "
+                         "mirrored around mid-swath")
+    p.add_argument("--reverse-starboard", action="store_true", help="flip starboard samples range-wise (near<->far)")
 
 
 def build_parser() -> argparse.ArgumentParser:
