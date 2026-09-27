@@ -117,6 +117,83 @@ xj.register_format("sdf", MyReader, detect=lambda head: head[:4] == b"\xff\xff\x
 
 Everything downstream (waterfalls, processing, mosaics, CLI) then works with it.
 
+## Many lines, one file per side
+
+If port and starboard live in separate files *per survey line* (mission),
+with unrelated filenames, don't try to match filenames: pair files by the
+ping times they actually recorded, which is reliable because a port file
+and its starboard counterpart were logged at the same instants.
+
+```bash
+xtfjsf pair --port dir_b/*.xtf --starboard dir_s1_h/*.xtf              # check the matches first
+xtfjsf batch-waterfall --port dir_b/*.xtf --starboard dir_s1_h/*.xtf -o pngs/
+```
+
+```python
+result = xj.match_mission_files(port_files, starboard_files)
+for m in result.pairs:
+    print(m.port, m.starboard, m.overlap_seconds, "s overlap")
+for f in result.unmatched_port + result.unmatched_starboard:
+    print("no match:", f)          # check these by hand
+
+wf = xj.combine_sides(
+    xj.read_waterfall(m.port, side="port"),
+    xj.read_waterfall(m.starboard, side="starboard"),
+)
+```
+
+This only reads each file's packet headers (fast, no sample decoding), so it
+scales to a folder of hundreds of lines. It needs both files to actually
+carry ping times; pass `tolerance_s=` to `match_mission_files` if the two
+loggers' clocks are a few seconds apart.
+
+For a mosaic you don't need to pair files at all — add each side file on
+its own, forcing its side, and it's placed correctly from its own
+navigation regardless of what the other side is doing:
+
+```bash
+xtfjsf mosaic --port dir_b/*.xtf --starboard dir_s1_h/*.xtf -o mosaic.tif
+```
+
+## Separate port and starboard files
+
+Some systems write each side to its own file. Reading one of those on its
+own gives a one-sided waterfall, with a warning. To combine them:
+
+```python
+wf = xj.read_waterfall_pair("line_port.xtf", "line_stbd.xtf")   # pings paired by time
+# or, step by step:
+port = xj.read_waterfall("line_port.xtf", side="port")
+stbd = xj.read_waterfall("line_stbd.xtf", side="starboard")
+wf = xj.combine_sides(port, stbd)          # wf.metadata reports paired / unpaired pings
+```
+
+`side=` puts the file's channel on that side whatever the file labels it. For
+mosaics, each side can be added separately; `--port` / `--starboard` make sure
+the data lands on the correct side of the track:
+
+```bash
+xtfjsf waterfall line_port.xtf line.png --starboard line_stbd.xtf
+xtfjsf mosaic --port *_port*.xtf --starboard *_stbd*.xtf -o mosaic.tif
+xtfjsf info --table *.xtf     # one line per file: channels, frequency, resolution, times
+```
+
+## Troubleshooting channel sides
+
+XTF writers disagree on how channels are labelled. Some set every channel
+header's `ChannelNumber` to 0, some count from 1, and some leave
+`TypeOfChannel` or `BytesPerSample` unset. The reader works out the layout
+from the data itself, and assigns port and starboard from `ChannelNumber`,
+then from packet order, then from the even = port / odd = starboard
+convention. If an image still looks one-sided, run:
+
+```bash
+xtfjsf info line.xtf     # see "first_ping_channels": side, channel numbers, samples, range
+```
+
+`build_waterfall` also warns when a whole side is empty. You can override the
+choice with `build_waterfall(pings, port_channel=0, starboard_channel=1)`.
+
 ## Validation status
 
 * XTF was cross-checked against the independent `pyxtf` library: files written

@@ -540,19 +540,129 @@ class XTFFile(SonarFile):
     def attitude(self) -> List[Dict[str, Any]]:
         return [d for _, d in self.records((3,))]
 
+    def time_bounds(self) -> tuple:
+        """(first ping time, last ping time, ping count) without decoding samples.
+
+        Much cheaper than reading every ping when all you need is when a file
+        was recorded, e.g. to pair port/starboard files from the same line.
+        """
+        sonar = [r for r in self.index if r.header_type in SONAR_TYPES]
+        if not sonar:
+            return None, None, 0
+
+        def t(rec: XTFRecordIndex) -> Optional[datetime]:
+            self._fh.seek(rec.offset)
+            buf = self._fh.read(PING_HEADER.size)
+            if len(buf) < PING_HEADER.size:
+                return None
+            h = PING_HEADER.unpack(buf)
+            return _safe_datetime(h["Year"], h["Month"], h["Day"], h["Hour"], h["Minute"], h["Second"], h["HSeconds"] * 10_000)
+
+        return t(sonar[0]), t(sonar[-1]), len(sonar)
+
     def notes(self) -> List[Dict[str, Any]]:
         return [d for _, d in self.records((1,))]
 
-    def _channel_side(self, number: int, info: Optional[Dict[str, Any]]) -> str:
-        t = info.get("TypeOfChannel") if info else None
-        if t == 1:
-            return PORT
-        if t == 2:
-            return STARBOARD
-        if t in (0, 3) and info is not None and any(c.get("TypeOfChannel") in (1, 2) for c in self.header.channels):
-            return OTHER
-        # Header gives no hint: Triton convention is even = port, odd = starboard.
-        return PORT if number % 2 == 0 else STARBOARD
+    # -- channel layout / side resolution --------------------------------
+    @property
+    def sonar_channel_infos(self) -> List[Dict[str, Any]]:
+        """CHANINFOs of the sonar channels, in order (port/starboard typed ones
+        when the header declares types, else the first NumberOfSonarChannels)."""
+        infos = self.header.channels
+        typed = [c for c in infos if c.get("TypeOfChannel") in (1, 2)]
+        if typed:
+            return typed
+        n = self.header.num_sonar_channels or len(infos)
+        return infos[:n]
+
+    @staticmethod
+    def _walk(buf: bytes, nchans: int, bps_for) -> Optional[tuple]:
+        """Locate channel headers/data assuming ``bps_for(k, chan_header)``
+        bytes per sample.  Returns (channels, leftover, truncated) or None."""
+        off = PING_HEADER.size
+        out = []
+        truncated = False
+        for k in range(nchans):
+            if off + PING_CHAN_HEADER.size > len(buf):
+                return None
+            ch = PING_CHAN_HEADER.unpack(buf, off)
+            off += PING_CHAN_HEADER.size
+            bps = bps_for(k, ch)
+            if not bps:
+                return None
+            n = ch["NumSamples"]
+            if off + n * bps > len(buf):
+                if k != nchans - 1:
+                    return None
+                n = (len(buf) - off) // bps  # truncated final record
+                truncated = True
+            out.append((ch, off, n, bps))
+            off += n * bps
+        return out, len(buf) - off, truncated
+
+    def _layout(self, buf: bytes, nchans: int) -> List[tuple]:
+        infos = self.header.channels
+        sonar = self.sonar_channel_infos
+
+        def by_number(k, ch):
+            num = ch["ChannelNumber"]
+            return infos[num].get("BytesPerSample") if num < len(infos) else 0
+
+        def by_position(k, ch):
+            return sonar[k].get("BytesPerSample") if k < len(sonar) else 0
+
+        candidates = [by_number, by_position] + [(lambda b: lambda k, ch: b)(b) for b in (2, 1, 4)]
+        results = []
+        for f in candidates:
+            r = self._walk(buf, nchans, f)
+            # 1st choice: a layout that fills the record up to its <64-byte padding
+            if r is not None and not r[2] and r[1] < 64:
+                return r[0]
+            results.append(r)
+        # then: the tightest complete layout, then a truncated one
+        complete = [r for r in results if r is not None and not r[2]]
+        if complete:
+            return min(complete, key=lambda r: r[1])[0]
+        for r in results:
+            if r is not None:
+                return r[0]
+        return []
+
+    def _assign_sides(self, chans: List[Dict[str, Any]]) -> tuple:
+        """Return (sides, channel_ids, infos) for the channels of one ping."""
+        infos = self.header.channels
+        sonar = self.sonar_channel_infos
+        n = len(chans)
+        type_side = {1: PORT, 2: STARBOARD}
+
+        def sides_from(info_list):
+            if any(i is None for i in info_list):
+                return None
+            return [type_side.get(i.get("TypeOfChannel"), OTHER) for i in info_list]
+
+        def usable(sides):
+            # With two or more channels, a mapping is only trusted when it
+            # yields both a port and a starboard channel; files whose header
+            # does not declare both sides fall through to the convention.
+            if sides is None:
+                return False
+            if n < 2:
+                return True
+            return PORT in sides and STARBOARD in sides
+
+        nums = [c["ChannelNumber"] for c in chans]
+        num_infos = [infos[x] if x < len(infos) else None for x in nums]
+        if len(set(nums)) == n:
+            sides = sides_from(num_infos)
+            if usable(sides):
+                return sides, nums, num_infos
+        pos_infos = [sonar[k] if k < len(sonar) else None for k in range(n)]
+        sides = sides_from(pos_infos)
+        if usable(sides):
+            return sides, list(range(n)), pos_infos
+        # No trustworthy header information: Triton convention, even = port.
+        sides = [PORT if k % 2 == 0 else STARBOARD for k in range(n)]
+        return sides, list(range(n)), [p if p is not None else {} for p in pos_infos]
 
     def _parse_ping(self, buf: bytes) -> Ping:
         mv = memoryview(buf)
@@ -588,28 +698,18 @@ class XTFFile(SonarFile):
         else:
             ping.easting, ping.northing = x, y
 
-        off = PING_HEADER.size
-        sonar_infos = self.header.channels
-        for _ in range(h["NumChansToFollow"]):
-            if off + PING_CHAN_HEADER.size > len(buf):
-                break
-            ch = PING_CHAN_HEADER.unpack(mv, off)
-            off += PING_CHAN_HEADER.size
-            num = ch["ChannelNumber"]
-            info = sonar_infos[num] if num < len(sonar_infos) else None
-            info_eff = dict(info) if info else {}
-            n = ch["NumSamples"]
-            bps = info_eff.get("BytesPerSample") or 0
-            if not bps:
-                # Unknown channel: infer sample width from the space left.
-                remaining = len(buf) - off
-                bps = 2 if n == 0 else max(1, min(4, remaining // max(n, 1)))
-                info_eff["BytesPerSample"] = bps
-            if off + n * bps > len(buf):
-                n = (len(buf) - off) // bps
-            samples = _decode_samples(mv, off, n, info_eff)
-            off += n * bps
-
+        layout = self._layout(buf, h["NumChansToFollow"])
+        if not layout:
+            return ping
+        sides, ids, infos = self._assign_sides([c for c, _, _, _ in layout])
+        for k, (ch, off, n, bps) in enumerate(layout):
+            info = dict(infos[k] or {})
+            if info.get("BytesPerSample") != bps:
+                # Header disagrees with the data: decode as unsigned integers
+                # of the width that fits (keeping a declared 4-byte format).
+                keep = bps == 4 and info.get("SampleFormat") in (1, 2, 5)
+                info.update(BytesPerSample=bps, SampleFormat=info["SampleFormat"] if keep else 0)
+            samples = _decode_samples(mv, off, n, info)
             start_range = max(ch["TimeDelay"], 0.0) * sv / 2.0
             if ch["SlantRange"] > 0 and n > 0:
                 dt = 2.0 * max(ch["SlantRange"] - start_range, 0.0) / (sv * n)
@@ -617,19 +717,28 @@ class XTFFile(SonarFile):
                 dt = ch["TimeDuration"] / n
             else:
                 dt = math.nan
-            freq_khz = ch["Frequency"] or (info_eff.get("Frequency") or math.nan)
+            freq_khz = ch["Frequency"] or (info.get("Frequency") or math.nan)
             ping.channels.append(
                 ChannelData(
                     samples=samples,
-                    side=self._channel_side(num, info),
-                    channel=num,
+                    side=sides[k],
+                    channel=ids[k],
                     frequency=float(freq_khz) * 1000.0,
                     sample_interval=dt,
                     sound_velocity=sv,
                     start_range=start_range,
-                    metadata=ch,
+                    metadata={**ch, "packet_index": k, "bytes_per_sample": bps},
                 )
             )
+        # A channel without range fields borrows the timing of a sibling
+        # (port and starboard share sample rate on every common system).
+        good = [c for c in ping.channels if math.isfinite(c.sample_interval) and c.sample_interval > 0]
+        for c in ping.channels:
+            if not (math.isfinite(c.sample_interval) and c.sample_interval > 0) and good:
+                ref = min(good, key=lambda g: (abs(g.num_samples - c.num_samples), abs(g.channel - c.channel)))
+                c.sample_interval = ref.sample_interval
+                c.start_range = ref.start_range
+                c.metadata["sample_interval_from_channel"] = ref.channel
         return ping
 
 

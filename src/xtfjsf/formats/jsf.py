@@ -169,6 +169,22 @@ _DATA_FORMATS = {
 }
 
 
+def _jsf_time(h: Dict[str, Any]) -> Optional[datetime]:
+    """Ping time: whole seconds from ``ping_time`` plus milliseconds-of-day if present."""
+    base = h["ping_time"]
+    t = float(base)
+    if h["ms_today"]:
+        t = (base // 86400) * 86400 + h["ms_today"] / 1000.0
+        if t - base > 43200:
+            t -= 86400
+        elif base - t > 43200:
+            t += 86400
+    try:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=t)
+    except OverflowError:
+        return None
+
+
 def _coords(h: Dict[str, Any]) -> Tuple[str, float, float]:
     """Return (kind, x, y) where kind is "geographic" or "projected"."""
     units, x, y = h["coordinate_units"], h["x"], h["y"]
@@ -289,6 +305,25 @@ class JSFFile(SonarFile):
     def nmea(self) -> List[Dict[str, Any]]:
         return [d for _, d in self.records((2002,))]
 
+    def time_bounds(self, subsystem: Optional[int] = None) -> Tuple[Optional[datetime], Optional[datetime], int]:
+        """(first ping time, last ping time, ping count) without decoding samples.
+
+        Much cheaper than reading every ping when all you need is when a file
+        was recorded, e.g. to pair port/starboard files from the same line.
+        """
+        recs = [r for r in self.index if r.message_type == 80 and (subsystem is None or r.subsystem == subsystem)]
+        if not recs:
+            return None, None, 0
+
+        def t(rec: JSFRecordIndex) -> Optional[datetime]:
+            self._fh.seek(rec.offset)
+            buf = self._fh.read(16 + SONAR_HEADER.size)
+            if len(buf) < 16 + SONAR_HEADER.size:
+                return None
+            return _jsf_time(SONAR_HEADER.unpack(buf, 16))
+
+        return t(recs[0]), t(recs[-1]), len(recs)
+
     def pings(self, subsystem: Optional[int] = None) -> Iterator[Ping]:
         """Yield merged pings.  Defaults to side-scan subsystems (20-22) when
         present, otherwise every subsystem."""
@@ -350,19 +385,7 @@ class JSFFile(SonarFile):
         else:
             side = OTHER
 
-        # Time: whole seconds from ping_time plus milliseconds-of-day if present.
-        base = h["ping_time"]
-        t = float(base)
-        if h["ms_today"]:
-            t = (base // 86400) * 86400 + h["ms_today"] / 1000.0
-            if t - base > 43200:
-                t -= 86400
-            elif base - t > 43200:
-                t += 86400
-        try:
-            time = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=t)
-        except OverflowError:
-            time = None
+        time = _jsf_time(h)
 
         kind, x, y = _coords(h)
         ping = Ping(

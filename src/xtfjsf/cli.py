@@ -16,7 +16,9 @@ from . import (
     JSFFile,
     Mosaic,
     build_waterfall,
+    combine_sides,
     convert,
+    match_mission_files,
     open_sonar,
     process,
     save_waterfall_png,
@@ -27,13 +29,21 @@ def _pings(f, subsystem):
     return f.pings(subsystem=subsystem) if isinstance(f, JSFFile) else f.pings()
 
 
-def _load(path, args):
+def _load(path, args, side=None):
     with open_sonar(path) as f:
         return build_waterfall(
             _pings(f, args.subsystem),
             frequency=args.frequency * 1000 if args.frequency else None,
             keep_complex=True,
+            side=side,
         )
+
+
+def _load_input(args):
+    """Waterfall for `waterfall`: one file, or a port file + --starboard file."""
+    if args.starboard:
+        return combine_sides(_load(args.file, args, "port"), _load(args.starboard, args, "starboard"))
+    return _load(args.file, args, getattr(args, "side", None))
 
 
 def _process(wf, args):
@@ -48,7 +58,47 @@ def _process(wf, args):
     )
 
 
+def _table_row(path) -> dict:
+    with open_sonar(path) as f:
+        n, t0, t1, first = 0, None, None, None
+        for p in f.pings():
+            n += 1
+            first = first or p
+            if p.time is not None:
+                t0 = p.time if t0 is None else min(t0, p.time)
+                t1 = p.time if t1 is None else max(t1, p.time)
+        records = f.record_counts()
+        if isinstance(f, JSFFile):
+            source = "subsystems " + ",".join(map(str, f.subsystems))
+        else:
+            h = f.header.fields
+            source = " ".join(x for x in (h.get("RecordingProgramName"), h.get("SonarName")) if x)
+    chans = []
+    for c in first.channels if first else []:
+        fmt = "cplx" if c.is_complex else str(c.samples.dtype)
+        freq = f"{c.frequency / 1000:.0f}kHz" if math.isfinite(c.frequency) else "?kHz"
+        chans.append(f"{c.side[:4]} {freq} {c.num_samples}x{fmt} {c.range_resolution * 100:.1f}cm {c.slant_range:.0f}m")
+    return {
+        "file": Path(path).name,
+        "format": f.format_name,
+        "source": source or "-",
+        "pings": str(n),
+        "start": t0.strftime("%Y-%m-%d %H:%M:%S") if t0 else "-",
+        "dur_s": f"{(t1 - t0).total_seconds():.0f}" if t0 and t1 else "-",
+        "records": ",".join(f"{k}:{v}" for k, v in sorted(records.items())),
+        "channels (first ping)": "; ".join(chans) or "-",
+    }
+
+
 def cmd_info(args) -> int:
+    if args.table:
+        rows = [_table_row(p) for p in args.files]
+        cols = list(rows[0]) if rows else []
+        width = {c: max(len(c), *(len(r[c]) for r in rows)) for c in cols}
+        print("  ".join(c.ljust(width[c]) for c in cols))
+        for r in rows:
+            print("  ".join(r[c].ljust(width[c]) for c in cols))
+        return 0
     for path in args.files:
         with open_sonar(path) as f:
             info = f.summary()
@@ -61,6 +111,23 @@ def cmd_info(args) -> int:
                     {k: c[k] for k in ("TypeOfChannel", "ChannelName", "Frequency", "BytesPerSample", "SampleFormat")}
                     for c in f.header.channels
                 ]
+            with open_sonar(path) as f2:
+                first = next(iter(f2.pings()), None)
+            info["first_ping_channels"] = [
+                {
+                    "side": c.side,
+                    "channel": c.channel,
+                    "header_channel_number": c.metadata.get("ChannelNumber"),
+                    "packet_index": c.metadata.get("packet_index"),
+                    "samples": c.num_samples,
+                    "bytes_per_sample": c.metadata.get("bytes_per_sample"),
+                    "frequency_hz": c.frequency,
+                    "range_resolution_m": c.range_resolution,
+                    "slant_range_m": c.slant_range,
+                    "complex": c.is_complex,
+                }
+                for c in (first.channels if first else [])
+            ]
         for k in ("start", "end"):
             if info[k] is not None:
                 info[k] = info[k].isoformat()
@@ -93,7 +160,8 @@ def cmd_nav(args) -> int:
 
 
 def cmd_waterfall(args) -> int:
-    wf = _process(_load(args.file, args), args) if not args.raw else _load(args.file, args).magnitude()
+    wf = _load_input(args)
+    wf = wf.magnitude() if args.raw else _process(wf, args)
     save_waterfall_png(wf, args.output, low=args.low, high=args.high, log=args.log)
     print(f"wrote {args.output}: {wf.num_pings} pings x {2 * wf.num_bins} bins @ {wf.resolution:.3f} m")
     return 0
@@ -101,8 +169,11 @@ def cmd_waterfall(args) -> int:
 
 def cmd_mosaic(args) -> int:
     m = Mosaic(cell_size=args.cell_size, method=args.method)
-    for path in args.files:
-        wf = _process(_load(path, args), args)
+    inputs = [(p, None) for p in args.files] + [(p, "port") for p in args.port] + [(p, "starboard") for p in args.starboard]
+    if not inputs:
+        raise SystemExit("mosaic: no input files")
+    for path, side in inputs:
+        wf = _process(_load(path, args, side), args)
         m.add(wf, smooth_pings=args.smooth)
         print(f"added {path}: {wf.num_pings} pings", file=sys.stderr)
     r = m.render(fill_holes=args.fill)
@@ -112,6 +183,45 @@ def cmd_mosaic(args) -> int:
     else:
         r.to_png(out, low=args.low, high=args.high, log=args.log)
     print(f"wrote {out}: {r.shape[1]} x {r.shape[0]} cells @ {args.cell_size} m, EPSG:{r.epsg}")
+    return 0
+
+
+def cmd_pair(args) -> int:
+    result = match_mission_files(args.port, args.starboard, tolerance_s=args.tolerance)
+    for m in result.pairs:
+        print(f"{m.port.name}  <->  {m.starboard.name}   "
+              f"overlap {m.overlap_seconds:+.1f}s   port {m.port_pings} pings, starboard {m.starboard_pings} pings")
+    if result.unmatched_port or result.unmatched_starboard:
+        print(file=sys.stderr)
+        for p in result.unmatched_port:
+            print(f"no starboard match for: {p}", file=sys.stderr)
+        for p in result.unmatched_starboard:
+            print(f"no port match for: {p}", file=sys.stderr)
+    print(f"\n{len(result.pairs)} pairs, {len(result.unmatched_port)} unmatched port, "
+          f"{len(result.unmatched_starboard)} unmatched starboard", file=sys.stderr)
+    return 0
+
+
+def cmd_batch_waterfall(args) -> int:
+    result = match_mission_files(args.port, args.starboard, tolerance_s=args.tolerance)
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    for m in result.pairs:
+        wf = combine_sides(
+            _load(m.port, args, "port"),
+            _load(m.starboard, args, "starboard"),
+        )
+        if not args.raw:
+            wf = _process(wf, args)
+        else:
+            wf = wf.magnitude()
+        out = outdir / (m.port.stem + ".png")
+        save_waterfall_png(wf, out, low=args.low, high=args.high, log=args.log)
+        print(f"wrote {out}  ({wf.num_pings} pings, {wf.metadata.get('paired_pings')} paired)")
+    for p in result.unmatched_port:
+        print(f"skipped (no starboard match): {p}", file=sys.stderr)
+    for p in result.unmatched_starboard:
+        print(f"skipped (no port match): {p}", file=sys.stderr)
     return 0
 
 
@@ -149,6 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("info", help="summarise files")
     p.add_argument("files", nargs="+")
+    p.add_argument("--table", action="store_true", help="one line per file, to compare many files")
     p.set_defaults(func=cmd_info)
 
     p = sub.add_parser("nav", help="export per-ping navigation to CSV")
@@ -158,15 +269,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_nav)
 
     p = sub.add_parser("waterfall", help="render a (processed) waterfall PNG")
-    p.add_argument("file")
+    p.add_argument("file", help="input file (the port file when --starboard is given)")
     p.add_argument("output")
+    p.add_argument("--starboard", metavar="FILE", help="separate starboard file to combine with FILE (port)")
+    p.add_argument("--side", choices=["port", "starboard"], help="FILE holds only this side")
     p.add_argument("--raw", action="store_true", help="no processing, just stack the pings")
     _add_select_args(p)
     _add_processing_args(p)
     p.set_defaults(func=cmd_waterfall)
 
     p = sub.add_parser("mosaic", help="georeferenced mosaic (.tif GeoTIFF or .png + world file)")
-    p.add_argument("files", nargs="+")
+    p.add_argument("files", nargs="*", help="two-sided files, or single-side files labelled correctly")
+    p.add_argument("--port", nargs="+", default=[], metavar="FILE", help="files holding only the port side")
+    p.add_argument("--starboard", nargs="+", default=[], metavar="FILE", help="files holding only the starboard side")
     p.add_argument("-o", "--output", required=True)
     p.add_argument("--cell-size", type=float, default=0.25)
     p.add_argument("--method", choices=["nearest", "mean", "max"], default="nearest")
@@ -176,6 +291,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_select_args(p)
     _add_processing_args(p)
     p.set_defaults(func=cmd_mosaic)
+
+    p = sub.add_parser("pair", help="match port/starboard files from the same line by ping time")
+    p.add_argument("--port", nargs="+", required=True, metavar="FILE")
+    p.add_argument("--starboard", nargs="+", required=True, metavar="FILE")
+    p.add_argument("--tolerance", type=float, default=5.0, help="seconds of clock drift allowed between sides")
+    p.set_defaults(func=cmd_pair)
+
+    p = sub.add_parser("batch-waterfall", help="pair port/starboard files by time and render one PNG per line")
+    p.add_argument("--port", nargs="+", required=True, metavar="FILE")
+    p.add_argument("--starboard", nargs="+", required=True, metavar="FILE")
+    p.add_argument("-o", "--output-dir", required=True)
+    p.add_argument("--tolerance", type=float, default=5.0, help="seconds of clock drift allowed between sides")
+    p.add_argument("--raw", action="store_true", help="no processing, just stack the pings")
+    _add_select_args(p)
+    _add_processing_args(p)
+    p.set_defaults(func=cmd_batch_waterfall)
 
     p = sub.add_parser("convert", help="convert between formats (e.g. JSF -> XTF)")
     p.add_argument("input")
