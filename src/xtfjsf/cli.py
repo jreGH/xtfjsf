@@ -18,6 +18,7 @@ from . import (
     build_waterfall,
     combine_sides,
     convert,
+    match_mission_files,
     open_sonar,
     process,
     save_waterfall_png,
@@ -185,6 +186,45 @@ def cmd_mosaic(args) -> int:
     return 0
 
 
+def cmd_pair(args) -> int:
+    result = match_mission_files(args.port, args.starboard, tolerance_s=args.tolerance)
+    for m in result.pairs:
+        print(f"{m.port.name}  <->  {m.starboard.name}   "
+              f"overlap {m.overlap_seconds:+.1f}s   port {m.port_pings} pings, starboard {m.starboard_pings} pings")
+    if result.unmatched_port or result.unmatched_starboard:
+        print(file=sys.stderr)
+        for p in result.unmatched_port:
+            print(f"no starboard match for: {p}", file=sys.stderr)
+        for p in result.unmatched_starboard:
+            print(f"no port match for: {p}", file=sys.stderr)
+    print(f"\n{len(result.pairs)} pairs, {len(result.unmatched_port)} unmatched port, "
+          f"{len(result.unmatched_starboard)} unmatched starboard", file=sys.stderr)
+    return 0
+
+
+def cmd_batch_waterfall(args) -> int:
+    result = match_mission_files(args.port, args.starboard, tolerance_s=args.tolerance)
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    for m in result.pairs:
+        wf = combine_sides(
+            _load(m.port, args, "port"),
+            _load(m.starboard, args, "starboard"),
+        )
+        if not args.raw:
+            wf = _process(wf, args)
+        else:
+            wf = wf.magnitude()
+        out = outdir / (m.port.stem + ".png")
+        save_waterfall_png(wf, out, low=args.low, high=args.high, log=args.log)
+        print(f"wrote {out}  ({wf.num_pings} pings, {wf.metadata.get('paired_pings')} paired)")
+    for p in result.unmatched_port:
+        print(f"skipped (no starboard match): {p}", file=sys.stderr)
+    for p in result.unmatched_starboard:
+        print(f"skipped (no port match): {p}", file=sys.stderr)
+    return 0
+
+
 def cmd_convert(args) -> int:
     kwargs = {}
     if Path(args.output).suffix.lower() == ".xtf":
@@ -251,6 +291,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_select_args(p)
     _add_processing_args(p)
     p.set_defaults(func=cmd_mosaic)
+
+    p = sub.add_parser("pair", help="match port/starboard files from the same line by ping time")
+    p.add_argument("--port", nargs="+", required=True, metavar="FILE")
+    p.add_argument("--starboard", nargs="+", required=True, metavar="FILE")
+    p.add_argument("--tolerance", type=float, default=5.0, help="seconds of clock drift allowed between sides")
+    p.set_defaults(func=cmd_pair)
+
+    p = sub.add_parser("batch-waterfall", help="pair port/starboard files by time and render one PNG per line")
+    p.add_argument("--port", nargs="+", required=True, metavar="FILE")
+    p.add_argument("--starboard", nargs="+", required=True, metavar="FILE")
+    p.add_argument("-o", "--output-dir", required=True)
+    p.add_argument("--tolerance", type=float, default=5.0, help="seconds of clock drift allowed between sides")
+    p.add_argument("--raw", action="store_true", help="no processing, just stack the pings")
+    _add_select_args(p)
+    _add_processing_args(p)
+    p.set_defaults(func=cmd_batch_waterfall)
 
     p = sub.add_parser("convert", help="convert between formats (e.g. JSF -> XTF)")
     p.add_argument("input")

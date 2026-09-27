@@ -29,6 +29,7 @@ from .formats import (
     writer_for,
 )
 from .georef import Mosaic, Raster, latlon_to_utm, pixel_coordinates, track, utm_to_latlon
+from .pairing import MatchResult, MissionPair, match_mission_files
 from .processing import (
     bottom_track,
     despeckle,
@@ -98,6 +99,8 @@ __all__ = [
     "ChannelData",
     "JSFFile",
     "JSFWriter",
+    "MatchResult",
+    "MissionPair",
     "Mosaic",
     "Ping",
     "Raster",
@@ -113,6 +116,7 @@ __all__ = [
     "detect_format",
     "formats",
     "latlon_to_utm",
+    "match_mission_files",
     "mask_water_column",
     "multilook",
     "normalize_beam_pattern",

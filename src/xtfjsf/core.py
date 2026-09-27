@@ -142,6 +142,22 @@ class SonarFile(abc.ABC):
     def read_all(self, **kwargs) -> List[Ping]:
         return list(self.pings(**kwargs))
 
+    def time_bounds(self) -> "tuple[Optional[datetime], Optional[datetime], int]":
+        """(first ping time, last ping time, ping count).
+
+        Formats that can get this from packet headers alone (XTF, JSF)
+        override this to avoid decoding every sample; this default reads
+        every ping and is only as fast as :meth:`pings`.
+        """
+        t0 = t1 = None
+        n = 0
+        for p in self.pings():
+            n += 1
+            if p.time is not None:
+                t0 = p.time if t0 is None else min(t0, p.time)
+                t1 = p.time if t1 is None else max(t1, p.time)
+        return t0, t1, n
+
     def summary(self) -> Dict[str, Any]:
         """Quick statistics about the file (reads every ping)."""
         n = 0

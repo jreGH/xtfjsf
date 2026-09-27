@@ -117,6 +117,44 @@ xj.register_format("sdf", MyReader, detect=lambda head: head[:4] == b"\xff\xff\x
 
 Everything downstream (waterfalls, processing, mosaics, CLI) then works with it.
 
+## Many lines, one file per side
+
+If port and starboard live in separate files *per survey line* (mission),
+with unrelated filenames, don't try to match filenames: pair files by the
+ping times they actually recorded, which is reliable because a port file
+and its starboard counterpart were logged at the same instants.
+
+```bash
+xtfjsf pair --port dir_b/*.xtf --starboard dir_s1_h/*.xtf              # check the matches first
+xtfjsf batch-waterfall --port dir_b/*.xtf --starboard dir_s1_h/*.xtf -o pngs/
+```
+
+```python
+result = xj.match_mission_files(port_files, starboard_files)
+for m in result.pairs:
+    print(m.port, m.starboard, m.overlap_seconds, "s overlap")
+for f in result.unmatched_port + result.unmatched_starboard:
+    print("no match:", f)          # check these by hand
+
+wf = xj.combine_sides(
+    xj.read_waterfall(m.port, side="port"),
+    xj.read_waterfall(m.starboard, side="starboard"),
+)
+```
+
+This only reads each file's packet headers (fast, no sample decoding), so it
+scales to a folder of hundreds of lines. It needs both files to actually
+carry ping times; pass `tolerance_s=` to `match_mission_files` if the two
+loggers' clocks are a few seconds apart.
+
+For a mosaic you don't need to pair files at all — add each side file on
+its own, forcing its side, and it's placed correctly from its own
+navigation regardless of what the other side is doing:
+
+```bash
+xtfjsf mosaic --port dir_b/*.xtf --starboard dir_s1_h/*.xtf -o mosaic.tif
+```
+
 ## Separate port and starboard files
 
 Some systems write each side to its own file. Reading one of those on its

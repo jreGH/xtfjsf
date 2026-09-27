@@ -540,6 +540,26 @@ class XTFFile(SonarFile):
     def attitude(self) -> List[Dict[str, Any]]:
         return [d for _, d in self.records((3,))]
 
+    def time_bounds(self) -> tuple:
+        """(first ping time, last ping time, ping count) without decoding samples.
+
+        Much cheaper than reading every ping when all you need is when a file
+        was recorded, e.g. to pair port/starboard files from the same line.
+        """
+        sonar = [r for r in self.index if r.header_type in SONAR_TYPES]
+        if not sonar:
+            return None, None, 0
+
+        def t(rec: XTFRecordIndex) -> Optional[datetime]:
+            self._fh.seek(rec.offset)
+            buf = self._fh.read(PING_HEADER.size)
+            if len(buf) < PING_HEADER.size:
+                return None
+            h = PING_HEADER.unpack(buf)
+            return _safe_datetime(h["Year"], h["Month"], h["Day"], h["Hour"], h["Minute"], h["Second"], h["HSeconds"] * 10_000)
+
+        return t(sonar[0]), t(sonar[-1]), len(sonar)
+
     def notes(self) -> List[Dict[str, Any]]:
         return [d for _, d in self.records((1,))]
 
