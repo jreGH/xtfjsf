@@ -131,6 +131,20 @@ def _pick_channel(ping: Ping, side: str, frequency: Optional[float], channel: Op
     return candidates[0]
 
 
+def _pick_single(ping: Ping, side: str, frequency: Optional[float], channel: Optional[int]) -> Optional[ChannelData]:
+    """The one channel of a single-side file: by number, else the channel
+    labelled ``side``, else the first channel with data."""
+    chans = [c for c in ping.channels if c.num_samples]
+    if channel is not None:
+        chans = [c for c in chans if c.channel == channel]
+    if not chans:
+        return None
+    if frequency is not None:
+        return min(chans, key=lambda c: abs((c.frequency if math.isfinite(c.frequency) else 0) - frequency))
+    labelled = [c for c in chans if c.side == side]
+    return (labelled or chans)[0]
+
+
 def _resample(ch: ChannelData, grid: np.ndarray, out_dtype) -> np.ndarray:
     """Interpolate a channel onto slant-range bin centres ``grid``."""
     if ch.num_samples == 0 or not math.isfinite(ch.range_resolution) or ch.range_resolution <= 0:
@@ -156,7 +170,9 @@ def _warn_missing(rows) -> None:
         missing = sum(r[k] is None for r in rows)
         if missing == len(rows):
             warnings.warn(f"no {side} channel in any ping: that half of the waterfall will be empty. "
-                          f"Check the channel sides with `xtfjsf info` and report the file layout.")
+                          f"If this file holds only one side (some systems write one file per side), "
+                          f"use read_waterfall_pair()/combine_sides() or `--starboard FILE` on the command "
+                          f"line; otherwise check the channel sides with `xtfjsf info`.")
         elif missing:
             warnings.warn(f"{missing} of {len(rows)} pings have no {side} channel")
     untimed = sum(1 for r in rows for c in r if c is not None and not (c.range_resolution > 0))
@@ -172,6 +188,7 @@ def build_waterfall(
     resolution: Optional[float] = None,
     max_range: Optional[float] = None,
     keep_complex: bool = False,
+    side: Optional[str] = None,
 ) -> Waterfall:
     """Stack pings into a :class:`Waterfall`.
 
@@ -181,7 +198,14 @@ def build_waterfall(
     the longest range.  ``frequency`` (Hz) selects the nearest channel on
     multi-frequency systems; ``port_channel``/``starboard_channel`` select by
     channel number instead.
+
+    ``side="port"`` or ``side="starboard"`` is for files holding a single side
+    (some systems write one file per side): one channel per ping is taken,
+    whatever the file labels it, and placed on that side; the other side is
+    left empty.  Combine two such waterfalls with :func:`combine_sides`.
     """
+    if side not in (None, PORT, STARBOARD):
+        raise ValueError("side must be None, 'port' or 'starboard'")
     rows: List[tuple] = []
     nav: List[tuple] = []
     freqs = []
@@ -189,8 +213,13 @@ def build_waterfall(
     range_seen = []
     any_complex = False
     for p in pings:
-        pc = _pick_channel(p, PORT, frequency, port_channel)
-        sc = _pick_channel(p, STARBOARD, frequency, starboard_channel)
+        if side is None:
+            pc = _pick_channel(p, PORT, frequency, port_channel)
+            sc = _pick_channel(p, STARBOARD, frequency, starboard_channel)
+        else:
+            wanted = port_channel if side == PORT else starboard_channel
+            ch = _pick_single(p, side, frequency, wanted)
+            pc, sc = (ch, None) if side == PORT else (None, ch)
         if pc is None and sc is None:
             continue
         for c in (pc, sc):
@@ -221,7 +250,8 @@ def build_waterfall(
         )
     if not rows:
         raise ValueError("no pings with port or starboard channels found")
-    _warn_missing(rows)
+    if side is None:
+        _warn_missing(rows)
     if resolution is None:
         resolution = float(np.min(res_seen)) if res_seen else 1.0
     if max_range is None:
@@ -285,3 +315,112 @@ def waterfall_to_pings(wf: Waterfall, sound_velocity: float = 1500.0) -> List[Pi
             )
         out.append(p)
     return out
+
+
+def _regrid(rows: np.ndarray, src_res: float, dst_res: float, n_bins: int) -> np.ndarray:
+    """Resample (n, m) rows from bin size ``src_res`` onto ``n_bins`` bins of ``dst_res``."""
+    if rows.shape[1] == n_bins and abs(src_res - dst_res) < 1e-12:
+        return rows
+    src = np.concatenate([[0.0], (np.arange(rows.shape[1]) + 0.5) * src_res, [rows.shape[1] * src_res]])
+    dst = (np.arange(n_bins) + 0.5) * dst_res
+    out = np.zeros((rows.shape[0], n_bins), dtype=rows.dtype)
+
+    def interp(v):
+        return np.interp(dst, src, np.concatenate([v[:1], v, v[-1:]]), left=0.0, right=0.0)
+
+    for i, r in enumerate(rows):
+        out[i] = interp(r.real) + 1j * interp(r.imag) if np.iscomplexobj(rows) else interp(r)
+    return out
+
+
+def combine_sides(
+    port: Waterfall,
+    starboard: Waterfall,
+    max_time_diff: Optional[float] = None,
+    resolution: Optional[float] = None,
+) -> Waterfall:
+    """Merge a port-only and a starboard-only waterfall into one.
+
+    Use this when a system writes each side to its own file.  Pings are
+    paired by time (nearest starboard ping within ``max_time_diff`` seconds,
+    default half the median ping interval), or by ping number when the files
+    carry no usable times.  Unpaired pings are kept with the other side empty.
+    Only the port half of ``port`` and the starboard half of ``starboard``
+    are used; if one of the files holds its data on the other half (for
+    example it was read without ``side=``), that half is used instead.
+    """
+    if port.ground_range != starboard.ground_range:
+        raise ValueError("both waterfalls must be slant range, or both ground range")
+
+    def half(wf: Waterfall, want: str) -> np.ndarray:
+        data = wf.port if want == PORT else wf.starboard
+        other = wf.starboard if want == PORT else wf.port
+        return other if not np.any(data) and np.any(other) else data
+
+    p_rows, s_rows = half(port, PORT), half(starboard, STARBOARD)
+    res = resolution or min(port.resolution, starboard.resolution)
+    n_bins = max(1, int(round(max(port.max_range, starboard.max_range) / res)))
+    dtype = np.result_type(p_rows.dtype, s_rows.dtype)
+    p_rows = _regrid(p_rows.astype(dtype), port.resolution, res, n_bins)
+    s_rows = _regrid(s_rows.astype(dtype), starboard.resolution, res, n_bins)
+
+    # pair pings: port index -> starboard index (or -1)
+    tp, ts = port.time, starboard.time
+    match = np.full(port.num_pings, -1)
+    if np.isfinite(tp).all() and np.isfinite(ts).all() and starboard.num_pings:
+        if max_time_diff is None:
+            ref = tp if port.num_pings > 1 else ts
+            max_time_diff = 0.5 * float(np.median(np.diff(np.sort(ref)))) if ref.size > 1 else np.inf
+        order = np.argsort(ts)
+        tss = ts[order]
+        pos = np.searchsorted(tss, tp)
+        lo = np.clip(pos - 1, 0, len(tss) - 1)
+        hi = np.clip(pos, 0, len(tss) - 1)
+        nearest = order[np.where(np.abs(tss[lo] - tp) <= np.abs(tss[hi] - tp), lo, hi)]
+        ok = np.abs(ts[nearest] - tp) <= max_time_diff
+        match[ok] = nearest[ok]
+    else:
+        lookup = {int(n): i for i, n in enumerate(starboard.ping_number)}
+        match = np.array([lookup.get(int(n), -1) for n in port.ping_number])
+    # each starboard ping is used once (keep the closest pairing)
+    if (match >= 0).any():
+        used = {}
+        for i in np.flatnonzero(match >= 0):
+            j = match[i]
+            if j in used:
+                k = used[j]
+                if abs(ts[j] - tp[i]) < abs(ts[j] - tp[k]):
+                    match[k] = -1
+                    used[j] = i
+                else:
+                    match[i] = -1
+            else:
+                used[j] = i
+    unmatched_s = np.setdiff1d(np.arange(starboard.num_pings), match[match >= 0])
+
+    n = port.num_pings + len(unmatched_s)
+    out_p = np.zeros((n, n_bins), dtype=dtype)
+    out_s = np.zeros((n, n_bins), dtype=dtype)
+    out_p[: port.num_pings] = p_rows
+    has = match >= 0
+    out_s[: port.num_pings][has] = s_rows[match[has]]
+    out_s[port.num_pings :] = s_rows[unmatched_s]
+    nav = {}
+    for name in Waterfall._PER_PING:
+        a, b = getattr(port, name), getattr(starboard, name)
+        col = np.concatenate([a, b[unmatched_s]]).astype(np.float64)
+        # fill port-side nav gaps from the paired starboard ping
+        gap = ~np.isfinite(col[: port.num_pings]) & has
+        col[: port.num_pings][gap] = b[match[gap]]
+        nav[name] = col
+    order = np.argsort(nav["time"], kind="stable") if np.isfinite(nav["time"]).all() else np.arange(n)
+    freqs = [f for f in (port.frequency, starboard.frequency) if math.isfinite(f)]
+    return Waterfall(
+        port=out_p[order],
+        starboard=out_s[order],
+        resolution=res,
+        ground_range=port.ground_range,
+        frequency=float(np.mean(freqs)) if freqs else math.nan,
+        metadata={"paired_pings": int(has.sum()), "port_only": int((~has).sum()), "starboard_only": int(len(unmatched_s))},
+        **{k: v[order] for k, v in nav.items()},
+    )
