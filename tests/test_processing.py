@@ -15,7 +15,8 @@ def test_waterfall_resamples_mixed_ranges():
     b = Ping(ping_number=2, channels=[
         ChannelData(np.full(400, 2, np.float32), xj.PORT, 0, sample_interval=2 * 0.05 / 1500),
     ])
-    wf = xj.build_waterfall([a, b])
+    with pytest.warns(UserWarning, match="1 of 2 pings have no starboard"):
+        wf = xj.build_waterfall([a, b])
     assert wf.resolution == pytest.approx(0.05)
     assert wf.max_range == pytest.approx(20.0)
     assert wf.port.shape == (2, 400)
@@ -118,3 +119,9 @@ def test_waterfall_to_pings_roundtrip(tmp_path, pings):
             w.write_ping(p)
     back = xj.read_waterfall(tmp_path / "p.xtf")
     np.testing.assert_allclose(back.port, wf.port, rtol=1e-5, atol=1e-3)
+
+
+def test_waterfall_warns_when_a_whole_side_is_missing(pings):
+    port_only = [Ping(ping_number=p.ping_number, channels=[p.port]) for p in pings[:5]]
+    with pytest.warns(UserWarning, match="no starboard channel in any ping"):
+        xj.build_waterfall(port_only)

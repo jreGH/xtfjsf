@@ -149,6 +149,21 @@ def _resample(ch: ChannelData, grid: np.ndarray, out_dtype) -> np.ndarray:
     return interp(vals).astype(out_dtype)
 
 
+def _warn_missing(rows) -> None:
+    import warnings
+
+    for k, side in ((0, PORT), (1, STARBOARD)):
+        missing = sum(r[k] is None for r in rows)
+        if missing == len(rows):
+            warnings.warn(f"no {side} channel in any ping: that half of the waterfall will be empty. "
+                          f"Check the channel sides with `xtfjsf info` and report the file layout.")
+        elif missing:
+            warnings.warn(f"{missing} of {len(rows)} pings have no {side} channel")
+    untimed = sum(1 for r in rows for c in r if c is not None and not (c.range_resolution > 0))
+    if untimed:
+        warnings.warn(f"{untimed} channel(s) have no sample-interval / range information and are left empty")
+
+
 def build_waterfall(
     pings: Iterable[Ping],
     frequency: Optional[float] = None,
@@ -206,6 +221,7 @@ def build_waterfall(
         )
     if not rows:
         raise ValueError("no pings with port or starboard channels found")
+    _warn_missing(rows)
     if resolution is None:
         resolution = float(np.min(res_seen)) if res_seen else 1.0
     if max_range is None:

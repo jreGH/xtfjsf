@@ -61,6 +61,23 @@ def cmd_info(args) -> int:
                     {k: c[k] for k in ("TypeOfChannel", "ChannelName", "Frequency", "BytesPerSample", "SampleFormat")}
                     for c in f.header.channels
                 ]
+            with open_sonar(path) as f2:
+                first = next(iter(f2.pings()), None)
+            info["first_ping_channels"] = [
+                {
+                    "side": c.side,
+                    "channel": c.channel,
+                    "header_channel_number": c.metadata.get("ChannelNumber"),
+                    "packet_index": c.metadata.get("packet_index"),
+                    "samples": c.num_samples,
+                    "bytes_per_sample": c.metadata.get("bytes_per_sample"),
+                    "frequency_hz": c.frequency,
+                    "range_resolution_m": c.range_resolution,
+                    "slant_range_m": c.slant_range,
+                    "complex": c.is_complex,
+                }
+                for c in (first.channels if first else [])
+            ]
         for k in ("start", "end"):
             if info[k] is not None:
                 info[k] = info[k].isoformat()

@@ -117,6 +117,22 @@ xj.register_format("sdf", MyReader, detect=lambda head: head[:4] == b"\xff\xff\x
 
 Everything downstream (waterfalls, processing, mosaics, CLI) then works with it.
 
+## Troubleshooting channel sides
+
+XTF writers disagree on how channels are labelled. Some set every channel
+header's `ChannelNumber` to 0, some count from 1, and some leave
+`TypeOfChannel` or `BytesPerSample` unset. The reader works out the layout
+from the data itself, and assigns port and starboard from `ChannelNumber`,
+then from packet order, then from the even = port / odd = starboard
+convention. If an image still looks one-sided, run:
+
+```bash
+xtfjsf info line.xtf     # see "first_ping_channels": side, channel numbers, samples, range
+```
+
+`build_waterfall` also warns when a whole side is empty. You can override the
+choice with `build_waterfall(pings, port_channel=0, starboard_channel=1)`.
+
 ## Validation status
 
 * XTF was cross-checked against the independent `pyxtf` library: files written
