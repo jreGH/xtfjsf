@@ -59,16 +59,26 @@ def read_waterfall(path, subsystem=None, **kwargs) -> Waterfall:
         return build_waterfall(pings, **kwargs)
 
 
-def read_waterfall_pair(port_path, starboard_path, subsystem=None, max_time_diff=None, **kwargs) -> Waterfall:
+def read_waterfall_pair(
+    port_path,
+    starboard_path,
+    subsystem=None,
+    max_time_diff=None,
+    reverse_port=False,
+    reverse_starboard=False,
+    **kwargs,
+) -> Waterfall:
     """Build one two-sided waterfall from separate port and starboard files.
 
     Each file is read with its side forced (so a mislabelled single-side file
     still lands on the right side) and pings are paired by time; see
-    :func:`combine_sides`.
+    :func:`combine_sides`.  ``reverse_port``/``reverse_starboard`` correct a
+    channel recorded back-to-front (far range first); see
+    :func:`build_waterfall`.
     """
     kwargs.pop("side", None)
-    port = read_waterfall(port_path, subsystem=subsystem, side=PORT, **kwargs)
-    stbd = read_waterfall(starboard_path, subsystem=subsystem, side=STARBOARD, **kwargs)
+    port = read_waterfall(port_path, subsystem=subsystem, side=PORT, reverse_port=reverse_port, **kwargs)
+    stbd = read_waterfall(starboard_path, subsystem=subsystem, side=STARBOARD, reverse_starboard=reverse_starboard, **kwargs)
     return combine_sides(port, stbd, max_time_diff=max_time_diff)
 
 

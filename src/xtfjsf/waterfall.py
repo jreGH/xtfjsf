@@ -189,6 +189,8 @@ def build_waterfall(
     max_range: Optional[float] = None,
     keep_complex: bool = False,
     side: Optional[str] = None,
+    reverse_port: bool = False,
+    reverse_starboard: bool = False,
 ) -> Waterfall:
     """Stack pings into a :class:`Waterfall`.
 
@@ -203,6 +205,16 @@ def build_waterfall(
     (some systems write one file per side): one channel per ping is taken,
     whatever the file labels it, and placed on that side; the other side is
     left empty.  Combine two such waterfalls with :func:`combine_sides`.
+
+    ``reverse_port``/``reverse_starboard``: some systems record one channel's
+    samples back-to-front (far range first, nadir last) instead of the usual
+    nadir-outwards order -- often only one side, since the two transducers'
+    electronics are commonly built as mirror images of each other. This
+    shows up as range-axis features (the seabed, targets) landing at the
+    wrong range, mirrored around the middle of the swath on the affected
+    side. There is no header field that says whether this was done, so it
+    can't be detected automatically: if that side looks range-reversed in
+    the output, set the matching flag.
     """
     if side not in (None, PORT, STARBOARD):
         raise ValueError("side must be None, 'port' or 'starboard'")
@@ -220,6 +232,10 @@ def build_waterfall(
             wanted = port_channel if side == PORT else starboard_channel
             ch = _pick_single(p, side, frequency, wanted)
             pc, sc = (ch, None) if side == PORT else (None, ch)
+        if reverse_port and pc is not None and pc.num_samples:
+            pc = replace(pc, samples=pc.samples[::-1].copy())
+        if reverse_starboard and sc is not None and sc.num_samples:
+            sc = replace(sc, samples=sc.samples[::-1].copy())
         if pc is None and sc is None:
             continue
         for c in (pc, sc):

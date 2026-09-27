@@ -117,6 +117,28 @@ xj.register_format("sdf", MyReader, detect=lambda head: head[:4] == b"\xff\xff\x
 
 Everything downstream (waterfalls, processing, mosaics, CLI) then works with it.
 
+## A side's ranges are mirrored (near/far reversed)
+
+Some sonar systems record one channel's samples back-to-front (far range
+first, nadir last) instead of the usual nadir-to-far order -- often just one
+side, since the two transducers' electronics are commonly built as mirror
+images of each other. It shows up as that side's seabed and targets sitting
+at the wrong range, mirrored around the middle of the swath, while the other
+side looks fine. There's no header field that records whether this was
+done, so it can't be detected automatically -- if you see it, tell the
+library which side to flip:
+
+```python
+wf = xj.build_waterfall(pings, reverse_port=True)      # or reverse_starboard=True
+wf = xj.read_waterfall("line.xtf", reverse_port=True)
+wf = xj.read_waterfall_pair(port_file, stbd_file, reverse_port=True)
+```
+
+```bash
+xtfjsf waterfall line.xtf line.png --reverse-port
+xtfjsf mosaic *.xtf -o mosaic.tif --reverse-port
+```
+
 ## Many lines, one file per side
 
 If port and starboard live in separate files *per survey line* (mission),
